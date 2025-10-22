@@ -1,0 +1,12 @@
+We need build a streamlit dashboard to visualize traces for plays in a given game.
+
+The structure of data can be found in Data_description.md. Essentially, we have game_id, play_id
+for wich we would like to see pre-play and post-throw traces. They are in different files.
+We also have landing location of the trace so that would be a lot helpful to plot.
+We can color code same team by same color. For represent different players (nfl_id), may be atext annotation aty their starting point is enough.
+We just need to plot x,y coordinates for trace. 
+
+We should be either able to randomnly load a game_id or select a game_id, then for each game we should have a butting to move to next play_id.
+
+Additionally, we should have provision to load prediction for post-throw traces.
+

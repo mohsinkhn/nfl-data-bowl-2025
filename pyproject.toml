@@ -8,11 +8,6 @@ version = "0.1.0"
 description = "NFL Data Bowl 2025 project for player tracking and prediction"
 readme = "README.md"
 requires-python = ">=3.12"
-
-[[tool.uv.index]]
-name = "pytorch"
-url = "https://download.pytorch.org/whl/cu124"
-explicit = true
 authors = [
     { name = "Mohsin Khan", email = "mhkhan2212@gmail.com" }
 ]
@@ -25,39 +20,46 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-
 dependencies = [
-    "numpy>=2.2.6",
-    "polars>=1.34.0",
-    "matplotlib>=3.10.6",
-    "plotly>=6.3.1",
-    { name = "torch", version = ">=2.4.0", index = "pytorch" },
-    { name = "torchvision", version = ">=0.19.0", index = "pytorch" },
-    { name = "torchaudio", version = ">=2.4.0", index = "pytorch" },
-    "scikit-learn>=1.7.2",
+    "numpy==2.3.4",
+    "polars==1.34.0",
+    "matplotlib==3.10.7",
+    "plotly==6.3.1",
+    "pandas==2.3.3",
+    "torch==2.6.0+cu124",
+    "scikit-learn==1.7.2",
+    "streamlit>=1.28.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "jupyter>=1.0.0",
-    "ipython>=8.0.0",
-    "black>=24.0.0",
-    "flake8>=7.0.0",
-    "pytest>=8.0.0",
-    "pytest-cov>=5.0.0",
+    "jupyter==1.1.1",
+    "ipython==9.6.0",
+    "black==25.9.0",
+    "flake8==7.3.0",
+    "pytest==8.4.2",
+    "pytest-cov==7.0.0",
 ]
 
 notebook = [
-    "jupyter>=1.0.0",
-    "ipython>=8.0.0",
-    "ipykernel>=6.0.0",
-    "notebook>=7.0.0",
+    "jupyter==1.1.1",
+    "ipython==9.6.0",
+    "ipykernel==7.0.1",
+    "notebook==7.4.7",
 ]
 
 [project.urls]
 Homepage = "https://github.com/mohsinkhn/nfl-data-bowl-2025"
 Repository = "https://github.com/mohsinkhn/nfl-data-bowl-2025"
 Issues = "https://github.com/mohsinkhn/nfl-data-bowl-2025/issues"
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
