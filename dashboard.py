@@ -141,16 +141,16 @@ def add_traces_to_plot(fig, input_df, output_df, pred_df=None):
             if len(last_frame) > 0:
                 x_end = last_frame["x"][0]
                 y_end = last_frame["y"][0]
-                orientation = last_frame["o"][0]  # orientation in degrees
+                movement_dir = last_frame["dir"][0]  # direction of motion in degrees
 
                 # Convert orientation to radians and calculate arrow endpoint
-                # Orientation: 0° = North (+y), 90° = East (+x), clockwise
+                # Direction: 0° = North (+y), 90° = East (+x), clockwise
                 import math
 
-                o_rad = math.radians(orientation)
+                dir_rad = math.radians(movement_dir)
                 arrow_length = 2.5  # yards
-                x_arrow = x_end + arrow_length * math.sin(o_rad)
-                y_arrow = y_end + arrow_length * math.cos(o_rad)
+                x_arrow = x_end + arrow_length * math.sin(dir_rad)
+                y_arrow = y_end + arrow_length * math.cos(dir_rad)
 
                 # Use line shape for cleaner arrow
                 fig.add_shape(
@@ -173,7 +173,7 @@ def add_traces_to_plot(fig, input_df, output_df, pred_df=None):
                             size=6,
                             color=color,
                             symbol="triangle-up",
-                            angle=orientation,
+                            angle=movement_dir,
                             line=dict(width=0),
                         ),
                         showlegend=False,

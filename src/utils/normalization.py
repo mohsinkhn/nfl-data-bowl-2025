@@ -97,8 +97,9 @@ def rotate_coordinates(
     cos_angle = np.cos(angle)
     sin_angle = np.sin(angle)
 
-    x = coords[..., 0]
-    y = coords[..., 1]
+    # Store original values to avoid in-place modification issues
+    x = coords[..., 0].copy()
+    y = coords[..., 1].copy()
 
     coords[..., 0] = cos_angle * x - sin_angle * y
     coords[..., 1] = sin_angle * x + cos_angle * y

@@ -59,9 +59,10 @@ def _build_encoder(config: ModelConfig) -> nn.Module:
 
 def _build_decoder(config: ModelConfig) -> nn.Module:
     """Instantiate the decoder specified by the model configuration."""
+    # Decoder input_dim should be output_dim (x, y coordinates)
     if config.decoder_type == "lstm":
         return LSTMDecoder(
-            input_dim=config.input_dim,
+            input_dim=config.output_dim,
             hidden_dim=config.hidden_dim,
             num_layers=config.num_layers,
             dropout=config.dropout,
@@ -69,7 +70,7 @@ def _build_decoder(config: ModelConfig) -> nn.Module:
         )
     if config.decoder_type == "gru":
         return GRUDecoder(
-            input_dim=config.input_dim,
+            input_dim=config.output_dim,
             hidden_dim=config.hidden_dim,
             num_layers=config.num_layers,
             dropout=config.dropout,
@@ -89,6 +90,15 @@ class TrajectoryPredictionModule(pl.LightningModule):
         transform_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
+
+        # Handle both dataclass instances and dicts (for checkpoint loading)
+        if isinstance(model_config, dict):
+            model_config = ModelConfig(**model_config)
+        if isinstance(training_config, dict):
+            training_config = TrainingConfig(**training_config)
+        if isinstance(data_config, dict):
+            data_config = DataConfig(**data_config)
+
         self.save_hyperparameters(
             {
                 "model_config": asdict(model_config),
@@ -142,7 +152,9 @@ class TrajectoryPredictionModule(pl.LightningModule):
         normalizer = torch.clamp(normalizer, min=1.0)
         return losses.sum() / normalizer
 
-    def training_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Tensor:  # noqa: D401
+    def training_step(
+        self, batch: Dict[str, Tensor], batch_idx: int
+    ) -> Tensor:  # noqa: D401
         encoder_inputs = batch["encoder_input"]
         decoder_inputs = batch["decoder_input"]
         decoder_targets = batch["decoder_target"]
@@ -307,7 +319,9 @@ def _build_dataloaders(
     """Create training and validation dataloaders based on the configuration."""
     try:
         from src.data import NFLTrajectoryDataset, collate_fn
-    except ImportError as exc:  # pragma: no cover - dataset module may be missing during docs build.
+    except (
+        ImportError
+    ) as exc:  # pragma: no cover - dataset module may be missing during docs build.
         raise ImportError(
             "NFLTrajectoryDataset is required for training. Ensure src/data.py is implemented."
         ) from exc
@@ -318,6 +332,7 @@ def _build_dataloaders(
         feature_cols=data_config.feature_cols,
         normalize=data_config.normalize,
         rotation_normalize=data_config.rotation_normalize,
+        align_heading=getattr(data_config, "align_heading", True),
     )
 
     train_dataset = NFLTrajectoryDataset(

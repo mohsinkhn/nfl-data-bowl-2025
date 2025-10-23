@@ -27,6 +27,7 @@ from tqdm import tqdm
 from src.configs.config_approach1_v0 import DataConfig, ModelConfig, TrainingConfig
 from src.data import NFLTrajectoryDataset, collate_fn
 from src.trainer import TrajectoryPredictionModule
+from src.utils.normalization import rotate_coordinates
 
 
 def load_test_data(
@@ -99,12 +100,20 @@ def create_test_dataset(
 
     Args:
         test_input_df: Test input DataFrame
-        test_target_df: Test target DataFrame
+        test_target_df: Test target DataFrame (contains frame structure)
         data_config: Data configuration from trained model
 
     Returns:
         NFLTrajectoryDataset for test set
     """
+    # For test set, we need to create dummy x, y values in the output
+    # since the dataset expects them for initialization
+    # We'll use zeros as placeholders - they won't be used for inference
+    if "x" not in test_target_df.columns or "y" not in test_target_df.columns:
+        test_target_df = test_target_df.copy()
+        test_target_df["x"] = 0.0
+        test_target_df["y"] = 0.0
+
     # Create temporary parquet files
     input_parquet, output_parquet = create_test_parquet_files(
         test_input_df, test_target_df
@@ -119,6 +128,7 @@ def create_test_dataset(
         feature_cols=data_config.feature_cols,
         normalize=data_config.normalize,
         rotation_normalize=data_config.rotation_normalize,
+        align_heading=getattr(data_config, "align_heading", True),
     )
 
     return test_dataset
@@ -181,21 +191,28 @@ def run_inference(
         for batch in tqdm(test_loader, desc="Inference"):
             # Move batch to device
             encoder_input = batch["encoder_input"].to(device)
+            decoder_input = batch["decoder_input"].to(device)
             decoder_mask = batch["decoder_mask"]
             metadata = batch["metadata"]
 
             # Get max decoder length for this batch
             max_len = decoder_mask.sum(dim=1).max().item()
 
+            # Get decoder start token (last encoder position)
+            decoder_start = decoder_input[:, 0, :]  # (batch, 2)
+
             # Run model prediction (no teacher forcing)
-            batch_preds = model.model.predict(encoder_input, max_len=int(max_len))
+            batch_preds = model.model.predict(
+                encoder_inputs=encoder_input,
+                decoder_start=decoder_start,
+                prediction_steps=int(max_len),
+            )
 
             # Move predictions back to CPU
             batch_preds = batch_preds.cpu().numpy()  # (batch, max_len, 2)
 
             # Process each sample in batch
-            for i in range(len(metadata)):
-                meta = metadata[i]
+            for i, meta in enumerate(metadata):
                 pred = batch_preds[i]  # (max_len, 2)
                 mask = decoder_mask[i].numpy()  # (max_len,)
 
@@ -203,29 +220,17 @@ def run_inference(
                 valid_len = int(mask.sum())
                 pred_valid = pred[:valid_len]  # (valid_len, 2)
 
-                # Get transform for this sample from dataset
-                sample_idx = None
-                for idx, key in enumerate(test_dataset.samples):
-                    if (
-                        key[0] == meta["game_id"]
-                        and key[1] == meta["play_id"]
-                        and key[2] == meta["nfl_id"]
-                    ):
-                        sample_idx = idx
-                        break
+                transform = meta.get("transform")
+                heading_angle = float(meta.get("heading_angle", 0.0) or 0.0)
 
-                if sample_idx is None:
-                    print(
-                        f"Warning: Could not find sample for {meta['game_id']}, {meta['play_id']}, {meta['nfl_id']}"
-                    )
-                    continue
+                pred_aligned = pred_valid
+                if heading_angle:
+                    pred_aligned = rotate_coordinates(pred_valid, heading_angle)
 
-                # Get the transform for denormalization
-                sample = test_dataset[sample_idx]
-                transform = sample["metadata"]["transform"]
-
-                # Denormalize predictions
-                pred_denorm = transform.inverse_transform(pred_valid)
+                if transform is not None:
+                    pred_denorm = transform.inverse_transform(pred_aligned)
+                else:
+                    pred_denorm = pred_aligned
 
                 # Store predictions with metadata
                 predictions.append(

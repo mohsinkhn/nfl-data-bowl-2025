@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
-from src.utils.normalization import CoordinateTransform
+from src.utils.normalization import CoordinateTransform, rotate_angles, rotate_coordinates
 
 
 def normalize_features(features: np.ndarray, feature_cols: List[str]) -> np.ndarray:
@@ -72,6 +72,7 @@ class NFLTrajectoryDataset(Dataset):
         feature_cols: Optional[List[str]] = None,
         normalize: bool = True,
         rotation_normalize: bool = True,
+        align_heading: bool = True,
     ):
         self.input_path = Path(input_parquet)
         self.output_path = Path(output_parquet)
@@ -79,14 +80,19 @@ class NFLTrajectoryDataset(Dataset):
         self.max_decoder_len = max_decoder_len
         self.normalize = normalize
         self.rotation_normalize = rotation_normalize
+        self.align_heading = align_heading
 
         if feature_cols is None:
             self.feature_cols = ["x", "y", "s", "a", "dir", "o"]
         else:
             self.feature_cols = feature_cols
 
-        self.input_dim = len(self.feature_cols)
+        self.derived_feature_names = ["landing_dx", "landing_dy", "landing_angle_diff"]
+        self.input_dim = len(self.feature_cols) + len(self.derived_feature_names)
         self.output_dim = 2  # (x, y)
+        self.angle_indices = [
+            idx for idx, name in enumerate(self.feature_cols) if name in {"dir", "o"}
+        ]
 
         # Load data
         print(f"Loading input data from {self.input_path}...")
@@ -98,6 +104,7 @@ class NFLTrajectoryDataset(Dataset):
         print("Pre-grouping data for fast access...")
         self.input_groups = {}
         self.output_groups = {}
+        self.ball_landings: Dict[tuple[int, int, int], Tuple[float, float]] = {}
 
         # Group input data
         for (game_id, play_id, nfl_id), group in input_df.groupby(
@@ -109,7 +116,15 @@ class NFLTrajectoryDataset(Dataset):
             self.input_groups[key] = {
                 "features": group[self.feature_cols].values.astype(np.float32),
                 "play_direction": group["play_direction"].iloc[0],
+                "ball_land": (
+                    float(group["ball_land_x"].iloc[0]),
+                    float(group["ball_land_y"].iloc[0]),
+                ),
             }
+            self.ball_landings[key] = (
+                float(group["ball_land_x"].iloc[0]),
+                float(group["ball_land_y"].iloc[0]),
+            )
 
         # Group output data
         for (game_id, play_id, nfl_id), group in output_df.groupby(
@@ -129,7 +144,9 @@ class NFLTrajectoryDataset(Dataset):
         print(f"  Encoder length: {self.max_encoder_len}")
         print(f"  Decoder length: {self.max_decoder_len}")
         print(f"  Features: {self.feature_cols}")
+        print(f"  Derived features: {self.derived_feature_names}")
         print(f"  Normalization: {self.normalize}")
+        print(f"  Align heading: {self.align_heading}")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -154,13 +171,20 @@ class NFLTrajectoryDataset(Dataset):
         input_features = input_data["features"].copy()
         play_direction = input_data["play_direction"]
         output_positions = self.output_groups[key].copy()
+        ball_land = np.array(input_data["ball_land"], dtype=np.float32)
+
+        dir_index = (
+            self.feature_cols.index("dir") if "dir" in self.feature_cols else None
+        )
+        player_dir_deg = None
+        landing_xy = ball_land.copy()
 
         # Apply normalization if enabled
+        transformer = None
         if self.normalize:
-            # Create transformer and fit on input
             transformer = CoordinateTransform(
                 field_dims=(120.0, 53.3),
-                normalize_field=self.rotation_normalize,
+                normalize_field=self.normalize,
                 normalize_rotation=self.rotation_normalize,
             )
             transformer.fit(input_features, play_direction)
@@ -168,8 +192,24 @@ class NFLTrajectoryDataset(Dataset):
             # Transform input features (handles x, y normalization and angle rotation)
             input_features = transformer.transform(input_features)
 
-            # Normalize all features to [-1, 1] or [0, 1]
-            input_features = normalize_features(input_features, self.feature_cols)
+            # Rotate angular features when play direction is normalized
+            if self.rotation_normalize and self.angle_indices:
+                rotation_angle = transformer.angle or 0.0
+                if rotation_angle:
+                    angles_deg = input_features[:, self.angle_indices]
+                    angles_rad = np.deg2rad(angles_deg)
+                    rotated_rad = rotate_angles(angles_rad, rotation_angle)
+                    rotated_deg = np.rad2deg(rotated_rad)
+                    rotated_deg = np.mod(rotated_deg, 360.0)
+                    input_features[:, self.angle_indices] = rotated_deg
+
+            # Transform landing location with the same normalization
+            landing_features = np.zeros(
+                (1, input_features.shape[1]), dtype=np.float32
+            )
+            landing_features[0, :2] = ball_land
+            landing_transformed = transformer.transform(landing_features)
+            landing_xy = landing_transformed[0, :2]
 
             # Transform output positions
             output_full = np.column_stack(
@@ -177,6 +217,67 @@ class NFLTrajectoryDataset(Dataset):
             )
             output_transformed = transformer.transform(output_full)
             output_positions = output_transformed[:, :2]
+
+        if dir_index is not None:
+            player_dir_deg = input_features[:, dir_index].copy()
+
+        heading_angle = 0.0
+        if self.align_heading and player_dir_deg is not None and len(player_dir_deg) > 0:
+            heading_angle = np.deg2rad(float(player_dir_deg[-1]))
+            cos_h = np.cos(-heading_angle)
+            sin_h = np.sin(-heading_angle)
+
+            coords = input_features[:, :2]
+            rotated = np.empty_like(coords, dtype=np.float64)
+            rotated[:, 0] = cos_h * coords[:, 0] - sin_h * coords[:, 1]
+            rotated[:, 1] = sin_h * coords[:, 0] + cos_h * coords[:, 1]
+            input_features[:, :2] = rotated.astype(np.float32)
+
+            heading_deg = np.rad2deg(heading_angle)
+            for idx_angle in self.angle_indices:
+                angles = (input_features[:, idx_angle] - heading_deg) % 360.0
+                input_features[:, idx_angle] = angles.astype(np.float32)
+
+            landing_xy = rotate_coordinates(
+                landing_xy[np.newaxis, :], -heading_angle
+            )[0].astype(np.float32)
+            output_positions = rotate_coordinates(
+                output_positions, -heading_angle
+            ).astype(np.float32)
+
+            if dir_index is not None:
+                player_dir_deg = input_features[:, dir_index].copy()
+
+        # Normalize features after heading alignment
+        if self.normalize:
+            input_features = normalize_features(input_features, self.feature_cols)
+
+        # Compute derived landing vector features for each encoder time step
+        landing_dx = landing_xy[0] - input_features[:, 0]
+        landing_dy = landing_xy[1] - input_features[:, 1]
+
+        if player_dir_deg is not None:
+            vec_angle = np.arctan2(landing_dy, landing_dx)
+            player_dir_rad = np.deg2rad(player_dir_deg)
+            angle_diff = np.arctan2(
+                np.sin(vec_angle - player_dir_rad),
+                np.cos(vec_angle - player_dir_rad),
+            )
+            landing_angle_feature = (angle_diff / np.pi).astype(np.float32)
+        else:
+            landing_angle_feature = np.zeros_like(landing_dx, dtype=np.float32)
+
+        derived_features = np.stack(
+            [
+                landing_dx.astype(np.float32),
+                landing_dy.astype(np.float32),
+                landing_angle_feature,
+            ],
+            axis=1,
+        )
+
+        # Concatenate derived features to encoder inputs
+        input_features = np.concatenate([input_features, derived_features], axis=1)
 
         # Pad/truncate encoder sequence
         encoder_len = len(input_features)
@@ -228,6 +329,10 @@ class NFLTrajectoryDataset(Dataset):
                 "nfl_id": nfl_id,
                 "encoder_len": encoder_len,
                 "decoder_len": decoder_len,
+                "transform": transformer,  # Store transform for inverse transformation
+                "ball_land_raw": ball_land.astype(np.float32),
+                "ball_land_normalized": landing_xy.astype(np.float32),
+                "heading_angle": float(heading_angle),
             },
         }
 

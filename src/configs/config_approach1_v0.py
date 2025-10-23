@@ -33,6 +33,7 @@ class DataConfig:
     # Additional features
     use_ball_landing: bool = False  # Whether to include ball landing location
     use_player_role: bool = False  # Whether to use player role encoding
+    align_heading: bool = True  # Rotate so final pre-throw heading is zero
 
     def __post_init__(self):
         """Validate configuration."""
@@ -53,7 +54,7 @@ class ModelConfig:
     """Model architecture configuration."""
 
     # Input/Output dimensions
-    input_dim: int = 6  # x, y, s, a, dir, o
+    input_dim: int = 9  # base features (x, y, s, a, dir, o) + landing vector features
     output_dim: int = 2  # x, y
 
     # Architecture
