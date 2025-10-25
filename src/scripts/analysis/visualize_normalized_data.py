@@ -64,35 +64,39 @@ def normalize_play(
 
         # Create transformer and fit on player's input trajectory
         transformer = CoordinateTransform(
-            field_dims=(120.0, 53.3), normalize_field=True, normalize_rotation=True
+            field_dims=(120.0, 53.3),
+            normalize_field=True,
+            normalize_rotation=True,
+            align_heading=True,
         )
 
-        # Prepare data for fitting (needs x, y, and other features)
-        player_data = player_input[["x", "y", "s", "a", "dir", "o"]].values
-        transformer.fit(player_data, play_direction)
+        coords_input = player_input[["x", "y"]].values
+        heading_seq = player_input["dir"].values if "dir" in player_input else None
+        transformer.fit(
+            coords_input,
+            play_direction,
+            heading_direction=heading_seq,
+        )
         transformers[nfl_id] = transformer
 
         # Transform input coordinates and angles
-        coords_in = player_input[["x", "y"]].values
-        coords_full = np.column_stack([coords_in, np.zeros((len(coords_in), 4))])
-        coords_norm = transformer.transform(coords_full)
+        coords_in = coords_input
+        coords_norm = transformer.transform_points(coords_in)
 
         play_input.loc[play_input["nfl_id"] == nfl_id, "x_norm"] = coords_norm[:, 0]
         play_input.loc[play_input["nfl_id"] == nfl_id, "y_norm"] = coords_norm[:, 1]
 
         # Transform direction and orientation angles
-        angles = player_input[["dir", "o"]].values
-        if transformer.normalize_rotation and transformer.angle is not None:
-            angles_norm = (angles + np.degrees(transformer.angle)) % 360
-        else:
-            angles_norm = angles
+        angles = np.deg2rad(player_input[["dir", "o"]].values)
+        angles_norm = transformer.transform_angles(angles)
+        angles_norm = np.rad2deg(angles_norm) % 360
 
         play_input.loc[play_input["nfl_id"] == nfl_id, "dir_norm"] = angles_norm[:, 0]
         play_input.loc[play_input["nfl_id"] == nfl_id, "o_norm"] = angles_norm[:, 1]
 
         # Test inverse transformation on input
-        coords_reconstructed = transformer.inverse_transform(coords_norm)
-        reconstruction_error = np.mean(np.abs(coords_reconstructed[:, :2] - coords_in))
+        coords_reconstructed = transformer.inverse_points(coords_norm)
+        reconstruction_error = np.mean(np.abs(coords_reconstructed - coords_in))
         max_reconstruction_error = max(max_reconstruction_error, reconstruction_error)
 
         play_input.loc[play_input["nfl_id"] == nfl_id, "x_reconstructed"] = (
@@ -105,10 +109,7 @@ def normalize_play(
         # Transform output coordinates if they exist
         if len(player_output) > 0:
             coords_out = player_output[["x", "y"]].values
-            coords_out_full = np.column_stack(
-                [coords_out, np.zeros((len(coords_out), 4))]
-            )
-            coords_out_norm = transformer.transform(coords_out_full)
+            coords_out_norm = transformer.transform_points(coords_out)
 
             play_output.loc[play_output["nfl_id"] == nfl_id, "x_norm"] = (
                 coords_out_norm[:, 0]
@@ -205,9 +206,16 @@ def plot_comparison_trajectory(
         last_dir = player_input["dir"].iloc[-1]
         last_o = player_input["o"].iloc[-1]
 
+        # Convert NFL angle convention (0°=North, clockwise) to math convention (0°=East, counter-clockwise)
+        # NFL: 0°=North, 90°=East, 180°=South, 270°=West (clockwise)
+        # Math: 0°=East, 90°=North, 180°=West, 270°=South (counter-clockwise)
+        # Conversion: math_angle = 90° - nfl_angle
+        dir_math = 90 - last_dir
+        o_math = 90 - last_o
+
         # Direction arrow (blue)
-        dx_dir = arrow_scale * np.cos(np.radians(last_dir))
-        dy_dir = arrow_scale * np.sin(np.radians(last_dir))
+        dx_dir = arrow_scale * np.cos(np.radians(dir_math))
+        dy_dir = arrow_scale * np.sin(np.radians(dir_math))
         ax_orig.arrow(
             last_x,
             last_y,
@@ -223,8 +231,8 @@ def plot_comparison_trajectory(
         )
 
         # Orientation arrow (green)
-        dx_o = arrow_scale * np.cos(np.radians(last_o))
-        dy_o = arrow_scale * np.sin(np.radians(last_o))
+        dx_o = arrow_scale * np.cos(np.radians(o_math))
+        dy_o = arrow_scale * np.sin(np.radians(o_math))
         ax_orig.arrow(
             last_x,
             last_y,
@@ -343,9 +351,13 @@ def plot_comparison_trajectory(
             last_dir_norm = player_input["dir_norm"].iloc[-1]
             last_o_norm = player_input["o_norm"].iloc[-1]
 
+            # Convert NFL angle convention to math convention for arrow plotting
+            dir_norm_math = 90 - last_dir_norm
+            o_norm_math = 90 - last_o_norm
+
             # Direction arrow (blue)
-            dx_dir_norm = norm_arrow_scale * np.cos(np.radians(last_dir_norm))
-            dy_dir_norm = norm_arrow_scale * np.sin(np.radians(last_dir_norm))
+            dx_dir_norm = norm_arrow_scale * np.cos(np.radians(dir_norm_math))
+            dy_dir_norm = norm_arrow_scale * np.sin(np.radians(dir_norm_math))
             ax.arrow(
                 last_x_norm,
                 last_y_norm,
@@ -361,8 +373,8 @@ def plot_comparison_trajectory(
             )
 
             # Orientation arrow (green)
-            dx_o_norm = norm_arrow_scale * np.cos(np.radians(last_o_norm))
-            dy_o_norm = norm_arrow_scale * np.sin(np.radians(last_o_norm))
+            dx_o_norm = norm_arrow_scale * np.cos(np.radians(o_norm_math))
+            dy_o_norm = norm_arrow_scale * np.sin(np.radians(o_norm_math))
             ax.arrow(
                 last_x_norm,
                 last_y_norm,

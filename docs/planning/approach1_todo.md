@@ -778,15 +778,14 @@ dependencies = [
 
 ---
 
-## Future Extensions (Post-Baseline)
+## Future Directions
 
-1. **Attention Mechanism**: Add encoder-decoder attention
-2. **Context Features**: Include ball landing location as auxiliary input
-3. **Player Roles**: Role-specific encoders (targeted receiver vs defender)
-4. **Multi-task Learning**: Predict (x, y, speed, direction) jointly
-5. **Transformer Models**: Replace RNN with transformer encoder-decoder
-6. **Graph Neural Networks**: Model player interactions explicitly
-7. **Ensemble**: Combine multiple model architectures
+1. **Input embeddings**: Project heterogeneous inputs via `Linear → BatchNorm → GELU` before the encoder (cf. LSTNet – Lai et al., 2018; Informer – Zhou et al., 2021). Added in code; tune projection dim/dropout.
+2. **Expanded context**: One-hot player role + normalised height/weight now travel through the pipeline; ablate with `--no-player-role/--no-player-attributes`.
+3. **Polar targets (Approach 2)**: Reparameterise decoder outputs as `(Δt, Δθ)` relative to the last encoder heading, integrate to recover `(x, y)`. Literature: Social-LSTM/Social-GAN (Alahi et al., CVPR 2016; Gupta et al., CVPR 2018), driving-trajectory embeddings (Li et al., ICRA 2020), sports trajectory models (Lu et al., KDD 2019). See `approach2.md` for plan.
+4. **Transformer/attention**: Swap recurrent blocks for sparse attention (e.g., Informer) once input projection is stable; optional cross-attention on encoder states.
+5. **Interaction modelling**: Graph or social pooling layers to capture defender–receiver coupling.
+6. **Ensembling**: Blend Cartesian and polar-trained models for competition submissions.
 
 ---
 

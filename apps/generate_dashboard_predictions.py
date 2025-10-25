@@ -5,12 +5,14 @@ loaded into the Streamlit dashboard for visualization.
 """
 
 import argparse
+import numpy as np
 import pandas as pd
 import torch
 from pathlib import Path
 from tqdm import tqdm
 
-from src.configs.config_approach1_v0 import DataConfig
+from src.configs.config_approach1_v0 import DataConfig, ModelConfig, TrainingConfig
+from src.utils.normalization import reconstruct_trajectory_from_polar
 from src.data import NFLTrajectoryDataset, collate_fn
 from src.trainer import TrajectoryPredictionModule
 from torch.utils.data import DataLoader
@@ -40,6 +42,8 @@ def generate_predictions_for_week(
     print(f"\nLoading checkpoint...")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     data_config = DataConfig(**checkpoint["hyper_parameters"]["data_config"])
+    model_config = ModelConfig(**checkpoint["hyper_parameters"]["model_config"])
+    training_config = TrainingConfig(**checkpoint["hyper_parameters"]["training_config"])
 
     print(f"✓ Configs loaded")
 
@@ -75,6 +79,10 @@ def generate_predictions_for_week(
         feature_cols=data_config.feature_cols,
         normalize=data_config.normalize,
         rotation_normalize=data_config.rotation_normalize,
+        align_heading=getattr(data_config, "align_heading", True),
+        use_player_role=getattr(data_config, "use_player_role", True),
+        use_player_attributes=getattr(data_config, "use_player_attributes", True),
+        use_polar_targets=getattr(data_config, "use_polar_targets", False),
     )
 
     dataloader = DataLoader(
@@ -88,7 +96,15 @@ def generate_predictions_for_week(
 
     # Load model
     print(f"\nLoading model...")
-    model = TrajectoryPredictionModule.load_from_checkpoint(checkpoint_path)
+    model_config.input_dim = dataset.input_dim
+    model_config.output_dim = dataset.output_dim
+
+    model = TrajectoryPredictionModule.load_from_checkpoint(
+        checkpoint_path,
+        model_config=model_config,
+        training_config=training_config,
+        data_config=data_config,
+    )
     model.eval()
     model.freeze()
 
@@ -100,6 +116,7 @@ def generate_predictions_for_week(
     print(f"\nGenerating predictions for {len(dataset):,} samples...")
 
     all_predictions = []
+    use_polar = getattr(data_config, "use_polar_targets", False)
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Predicting"):
@@ -108,15 +125,25 @@ def generate_predictions_for_week(
             decoder_mask = batch["decoder_mask"]
             metadata = batch["metadata"]
 
-            # Get predictions
-            decoder_start = decoder_input[:, 0, :]
-            max_len = data_config.max_decoder_len
-
-            predictions = model.model.predict(
-                encoder_inputs=encoder_input,
-                decoder_start=decoder_start,
-                prediction_steps=int(max_len),
-            )
+            max_len = int(decoder_mask.sum(dim=1).max().item())
+            prediction_mode = getattr(model, "prediction_mode", "autoregressive")
+            if prediction_mode == "autoregressive":
+                if use_polar:
+                    decoder_start = torch.zeros_like(decoder_input[:, 0, :])
+                else:
+                    decoder_start = decoder_input[:, 0, :]
+                predictions = model.model.predict(
+                    encoder_inputs=encoder_input,
+                    decoder_start=decoder_start,
+                    prediction_steps=int(max_len),
+                )
+            else:
+                predictions = model.model.predict(
+                    encoder_inputs=encoder_input,
+                    encoder_mask=batch.get("encoder_mask"),
+                )
+                if predictions.size(1) > max_len:
+                    predictions = predictions[:, :max_len]
 
             # Convert to CPU
             predictions = predictions.cpu().numpy()
@@ -129,13 +156,20 @@ def generate_predictions_for_week(
 
                 # Get valid predictions
                 valid_len = int(mask.sum())
-                pred_valid = pred[:valid_len]
+                if use_polar:
+                    last_pos = np.array(meta["last_position_canonical"], dtype=np.float32)
+                    last_heading = float(meta["last_heading"])
+                    pred_valid = reconstruct_trajectory_from_polar(
+                        pred[:valid_len], last_pos, last_heading
+                    )
+                else:
+                    pred_valid = pred[:valid_len]
 
                 # Get transform for denormalization
                 transform = meta.get("transform")
                 if transform is not None:
                     # Denormalize to physical coordinates
-                    pred_denorm = transform.inverse_transform(pred_valid)
+                    pred_denorm = transform.inverse_points(pred_valid)
                 else:
                     pred_denorm = pred_valid
 

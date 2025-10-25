@@ -85,14 +85,49 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable play-direction rotation normalization",
     )
+    data_group.add_argument(
+        "--no-player-role",
+        action="store_true",
+        help="Disable player role one-hot features",
+    )
+    data_group.add_argument(
+        "--no-player-attributes",
+        action="store_true",
+        help="Disable player height/weight features",
+    )
+    data_group.add_argument(
+        "--use-polar-targets",
+        action="store_true",
+        help="Predict delta time/angle instead of Cartesian coordinates",
+    )
+    data_group.add_argument(
+        "--rotation-augmentation-prob",
+        type=float,
+        default=None,
+        help="Probability of applying random rotation augmentation during training",
+    )
+    data_group.add_argument(
+        "--rotation-augmentation-degrees",
+        type=float,
+        default=None,
+        help="Maximum absolute rotation (degrees) for augmentation",
+    )
 
     model_group = parser.add_argument_group("Model overrides")
     model_group.add_argument("--encoder-type", choices=["lstm", "gru"], default=None)
-    model_group.add_argument("--decoder-type", choices=["lstm", "gru"], default=None)
+    model_group.add_argument(
+        "--decoder-type", choices=["lstm", "gru", "none"], default=None
+    )
     model_group.add_argument("--hidden-dim", type=int, default=None)
     model_group.add_argument("--num-layers", type=int, default=None)
     model_group.add_argument("--dropout", type=float, default=None)
     model_group.add_argument("--teacher-forcing-ratio", type=float, default=None)
+    model_group.add_argument(
+        "--prediction-mode",
+        choices=["autoregressive", "direct"],
+        default=None,
+        help="Use 'direct' to predict the full trajectory without a decoder",
+    )
     model_group.add_argument(
         "--use-attention",
         action="store_true",
@@ -117,12 +152,13 @@ def parse_args() -> argparse.Namespace:
     train_group.add_argument(
         "--scheduler",
         type=str,
-        choices=["reduce_on_plateau", "cosine", "none"],
+        choices=["reduce_on_plateau", "cosine", "cosine_warmup", "none"],
         default=None,
     )
     train_group.add_argument("--scheduler-patience", type=int, default=None)
     train_group.add_argument("--scheduler-factor", type=float, default=None)
     train_group.add_argument("--scheduler-min-lr", type=float, default=None)
+    train_group.add_argument("--scheduler-warmup-epochs", type=int, default=None)
     train_group.add_argument("--early-stopping-patience", type=int, default=None)
     train_group.add_argument("--monitor-metric", type=str, default=None)
     train_group.add_argument("--monitor-mode", choices=["min", "max"], default=None)
@@ -135,6 +171,12 @@ def parse_args() -> argparse.Namespace:
     train_group.add_argument("--devices", type=int, default=None)
     train_group.add_argument("--precision", type=str, default=None)
     train_group.add_argument("--seed", type=int, default=None)
+    train_group.add_argument(
+        "--pretrained-encoder",
+        type=Path,
+        default=None,
+        help="Path to encoder pretraining checkpoint",
+    )
     train_group.add_argument(
         "--wandb-mode",
         choices=["online", "offline", "disabled"],
@@ -170,11 +212,19 @@ def main() -> None:
         "num_workers": args.num_workers,
         "max_encoder_len": args.max_encoder_len,
         "max_decoder_len": args.max_decoder_len,
+        "rotation_augmentation_prob": args.rotation_augmentation_prob,
+        "rotation_augmentation_degrees": args.rotation_augmentation_degrees,
     }
     if args.no_normalize:
         data_overrides["normalize"] = False
     if args.no_rotation_normalize:
         data_overrides["rotation_normalize"] = False
+    if args.no_player_role:
+        data_overrides["use_player_role"] = False
+    if args.no_player_attributes:
+        data_overrides["use_player_attributes"] = False
+    if args.use_polar_targets:
+        data_overrides["use_polar_targets"] = True
     data_config = _update_dataclass(data_config, data_overrides)
 
     model_overrides = {
@@ -184,6 +234,7 @@ def main() -> None:
         "num_layers": args.num_layers,
         "dropout": args.dropout,
         "teacher_forcing_ratio": args.teacher_forcing_ratio,
+        "prediction_mode": args.prediction_mode,
         "use_attention": True if args.use_attention else None,
         "use_ball_context": True if args.use_ball_context else None,
     }
@@ -198,6 +249,7 @@ def main() -> None:
         "scheduler_patience": args.scheduler_patience,
         "scheduler_factor": args.scheduler_factor,
         "scheduler_min_lr": args.scheduler_min_lr,
+        "scheduler_warmup_epochs": args.scheduler_warmup_epochs,
         "early_stopping_patience": args.early_stopping_patience,
         "monitor_metric": args.monitor_metric,
         "monitor_mode": args.monitor_mode,
@@ -212,6 +264,10 @@ def main() -> None:
         "seed": args.seed,
     }
     training_config = _update_dataclass(training_config, training_overrides)
+
+    pretrained_encoder_path = (
+        str(args.pretrained_encoder) if args.pretrained_encoder is not None else None
+    )
 
     if args.wandb_mode is not None:
         setattr(training_config, "wandb_mode", args.wandb_mode)
@@ -236,6 +292,7 @@ def main() -> None:
         model_config=model_config,
         data_config=data_config,
         training_config=training_config,
+        pretrained_encoder_path=pretrained_encoder_path,
     )
 
     best_checkpoint = None

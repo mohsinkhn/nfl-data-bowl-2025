@@ -6,6 +6,7 @@ import numpy as np
 from pathlib import Path
 
 from src.configs.config_approach1_v0 import DataConfig, ModelConfig, TrainingConfig
+from src.utils.normalization import reconstruct_trajectory_from_polar
 from src.data import NFLTrajectoryDataset, collate_fn
 from src.trainer import TrajectoryPredictionModule
 from torch.utils.data import DataLoader
@@ -31,6 +32,7 @@ def evaluate_model(checkpoint_path: str, fold: str = "fold1", batch_size: int = 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     data_config = DataConfig(**checkpoint["hyper_parameters"]["data_config"])
     model_config = ModelConfig(**checkpoint["hyper_parameters"]["model_config"])
+    training_config = TrainingConfig(**checkpoint["hyper_parameters"]["training_config"])
 
     print(f"✓ Configs loaded")
     print(f"  Encoder length: {data_config.max_encoder_len}")
@@ -46,6 +48,10 @@ def evaluate_model(checkpoint_path: str, fold: str = "fold1", batch_size: int = 
         feature_cols=data_config.feature_cols,
         normalize=data_config.normalize,
         rotation_normalize=data_config.rotation_normalize,
+        align_heading=getattr(data_config, "align_heading", True),
+        use_player_role=getattr(data_config, "use_player_role", True),
+        use_player_attributes=getattr(data_config, "use_player_attributes", True),
+        use_polar_targets=getattr(data_config, "use_polar_targets", False),
     )
 
     val_loader = DataLoader(
@@ -59,7 +65,15 @@ def evaluate_model(checkpoint_path: str, fold: str = "fold1", batch_size: int = 
 
     # Load model
     print(f"\nLoading model...")
-    model = TrajectoryPredictionModule.load_from_checkpoint(checkpoint_path)
+    model_config.input_dim = val_dataset.input_dim
+    model_config.output_dim = val_dataset.output_dim
+
+    model = TrajectoryPredictionModule.load_from_checkpoint(
+        checkpoint_path,
+        model_config=model_config,
+        training_config=training_config,
+        data_config=data_config,
+    )
     model.eval()
     model.freeze()
 
@@ -75,6 +89,7 @@ def evaluate_model(checkpoint_path: str, fold: str = "fold1", batch_size: int = 
     all_targets = []
     all_masks = []
     all_transforms = []
+    use_polar = getattr(data_config, "use_polar_targets", False)
 
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating"):
@@ -84,16 +99,22 @@ def evaluate_model(checkpoint_path: str, fold: str = "fold1", batch_size: int = 
             decoder_mask = batch["decoder_mask"]
             metadata = batch["metadata"]
 
-            # Get predictions using predict method (no teacher forcing)
-            decoder_start = decoder_input[:, 0, :]  # (batch, 2)
-            # Use full max_decoder_len to ensure consistent shapes
-            max_len = data_config.max_decoder_len
-
-            predictions = model.model.predict(
-                encoder_inputs=encoder_input,
-                decoder_start=decoder_start,
-                prediction_steps=int(max_len),
-            )
+            prediction_mode = getattr(model, "prediction_mode", "autoregressive")
+            max_len = int(decoder_mask.sum(dim=1).max().item())
+            if prediction_mode == "autoregressive":
+                decoder_start = decoder_input[:, 0, :]  # (batch, 2)
+                predictions = model.model.predict(
+                    encoder_inputs=encoder_input,
+                    decoder_start=decoder_start,
+                    prediction_steps=int(max_len),
+                )
+            else:
+                predictions = model.model.predict(
+                    encoder_inputs=encoder_input,
+                    encoder_mask=batch.get("encoder_mask"),
+                )
+                if predictions.size(1) > max_len:
+                    predictions = predictions[:, :max_len]
 
             # Store for metrics (already at max_decoder_len)
             all_predictions.append(predictions.cpu())
@@ -106,21 +127,43 @@ def evaluate_model(checkpoint_path: str, fold: str = "fold1", batch_size: int = 
     targets = torch.cat(all_targets, dim=0).numpy()  # (N, T, 2)
     masks = torch.cat(all_masks, dim=0).numpy()  # (N, T)
 
+    predictions_canonical = np.zeros_like(predictions)
+    targets_canonical = np.zeros_like(targets)
+    for i, meta in enumerate(all_transforms):
+        mask_i = masks[i].astype(bool)
+        if not mask_i.any():
+            continue
+        if use_polar:
+            last_pos = np.array(meta["last_position_canonical"], dtype=np.float32)
+            last_heading = float(meta["last_heading"])
+            canon_pred = reconstruct_trajectory_from_polar(
+                predictions[i][mask_i], last_pos, last_heading
+            )
+            predictions_canonical[i, : canon_pred.shape[0]] = 0.0
+            predictions_canonical[i, : canon_pred.shape[0]] = canon_pred
+            canon_target = np.asarray(
+                meta["decoder_target_cartesian"], dtype=np.float32
+            )[: canon_pred.shape[0]]
+            targets_canonical[i, : canon_target.shape[0]] = 0.0
+            targets_canonical[i, : canon_target.shape[0]] = canon_target
+        else:
+            predictions_canonical[i] = predictions[i]
+            targets_canonical[i] = targets[i]
+
     # Apply inverse transform to get back to original coordinates (yards)
     print(f"\nApplying inverse transform to get physical coordinates...")
-    predictions_physical = np.zeros_like(predictions)
-    targets_physical = np.zeros_like(targets)
+    predictions_physical = np.zeros_like(predictions_canonical)
+    targets_physical = np.zeros_like(targets_canonical)
 
     for i in range(len(predictions)):
         transform = all_transforms[i].get("transform")
         if transform is not None:
-            # Apply inverse transform to predictions and targets
-            predictions_physical[i] = transform.inverse_transform(predictions[i])
-            targets_physical[i] = transform.inverse_transform(targets[i])
+            predictions_physical[i] = transform.inverse_points(predictions_canonical[i])
+            targets_physical[i] = transform.inverse_points(targets_canonical[i])
         else:
             # No transform (shouldn't happen with normalize=True)
-            predictions_physical[i] = predictions[i]
-            targets_physical[i] = targets[i]
+            predictions_physical[i] = predictions_canonical[i]
+            targets_physical[i] = targets_canonical[i]
 
     print(f"✓ Converted to physical coordinates (yards)")
 

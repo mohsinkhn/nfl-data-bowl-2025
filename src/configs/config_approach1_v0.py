@@ -10,6 +10,7 @@ class DataConfig:
 
     # Paths
     data_dir: str = "data/processed/fold1"
+    dataset_type: str = "baseline"  # 'baseline' or 'target_receiver'
 
     # Sequence lengths
     max_encoder_len: int = 40  # Based on analysis: 90th percentile
@@ -17,8 +18,19 @@ class DataConfig:
 
     # Features
     feature_cols: List[str] = field(
-        default_factory=lambda: ["x", "y", "s", "a", "dir", "o"]
+        default_factory=lambda: [
+            "x",
+            "y",
+            "s",
+            "a",
+            "dir",
+            "o",
+            "ball_land_x",
+            "ball_land_y",
+            "ball_angle",
+        ]
     )
+    use_ball_landing: bool = True  # Deprecated; retained for compatibility.
 
     # Normalization options
     normalize: bool = True
@@ -31,9 +43,16 @@ class DataConfig:
     pin_memory: bool = True
 
     # Additional features
-    use_ball_landing: bool = False  # Whether to include ball landing location
-    use_player_role: bool = False  # Whether to use player role encoding
-    align_heading: bool = True  # Rotate so final pre-throw heading is zero
+    use_player_role: bool = True  # Whether to use player role encoding
+    use_player_attributes: bool = True  # Whether to include player weight/height
+    use_polar_targets: bool = False  # Predict delta time/angle instead of x,y
+    align_heading: bool = False  # Do not align heading by default
+    rotation_augmentation_prob: float = 0.0  # Probability of random rotation augmentation (train only)
+    rotation_augmentation_degrees: float = 45.0  # Max absolute degrees for rotation augmentation
+    vertical_flip_prob: float = 0.0  # Probability of flipping across horizontal axis
+    target_only: bool = False  # Filter to targeted receivers (Approach 3)
+    target_min_decoder_len: int = 1  # Minimum decoder frames required
+    use_ball_residual_targets: bool = False  # Train on residual offsets to landing spot
 
     def __post_init__(self):
         """Validate configuration."""
@@ -47,6 +66,28 @@ class DataConfig:
             )
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if not 0.0 <= self.rotation_augmentation_prob <= 1.0:
+            raise ValueError(
+                f"rotation_augmentation_prob must be in [0, 1], got {self.rotation_augmentation_prob}"
+            )
+        if self.rotation_augmentation_degrees < 0.0:
+            raise ValueError(
+                f"rotation_augmentation_degrees must be non-negative, got {self.rotation_augmentation_degrees}"
+            )
+        if self.dataset_type not in {"baseline", "target_receiver"}:
+            raise ValueError(
+                f"dataset_type must be 'baseline' or 'target_receiver', got {self.dataset_type}"
+            )
+        if not 0.0 <= self.vertical_flip_prob <= 1.0:
+            raise ValueError(
+                f"vertical_flip_prob must be in [0, 1], got {self.vertical_flip_prob}"
+            )
+        if self.target_min_decoder_len <= 0:
+            raise ValueError(
+                f"target_min_decoder_len must be positive, got {self.target_min_decoder_len}"
+            )
+        if not isinstance(self.use_ball_residual_targets, bool):
+            raise ValueError("use_ball_residual_targets must be boolean")
 
 
 @dataclass
@@ -54,12 +95,13 @@ class ModelConfig:
     """Model architecture configuration."""
 
     # Input/Output dimensions
-    input_dim: int = 9  # base features (x, y, s, a, dir, o) + landing vector features
+    input_dim: int = 12  # base features + derived landing/length features (angles as sin/cos)
     output_dim: int = 2  # x, y
 
     # Architecture
     encoder_type: str = "lstm"  # 'lstm' or 'gru'
     decoder_type: str = "lstm"  # 'lstm' or 'gru'
+    prediction_mode: str = "autoregressive"  # 'autoregressive' or 'direct'
     hidden_dim: int = 128
     num_layers: int = 2
     dropout: float = 0.1
@@ -71,6 +113,13 @@ class ModelConfig:
 
     # Ball landing context
     use_ball_context: bool = False  # Concatenate ball landing to decoder input
+    ball_context_dim: int = 0  # Number of context features captured from encoder inputs
+    ball_context_start: int = -4  # Inclusive index used to slice context from encoder inputs
+    use_input_projection: bool = True
+    input_projection_dim: Optional[int] = None
+    input_projection_dropout: float = 0.1
+    input_projection_batchnorm: bool = True
+    encoder_input_dim: int = 0
 
     def __post_init__(self):
         """Validate configuration."""
@@ -78,9 +127,17 @@ class ModelConfig:
             raise ValueError(
                 f"encoder_type must be 'lstm' or 'gru', got {self.encoder_type}"
             )
-        if self.decoder_type not in ["lstm", "gru"]:
+        if self.decoder_type not in ["lstm", "gru", "none"]:
             raise ValueError(
-                f"decoder_type must be 'lstm' or 'gru', got {self.decoder_type}"
+                f"decoder_type must be 'lstm', 'gru', or 'none', got {self.decoder_type}"
+            )
+        if self.prediction_mode not in ["autoregressive", "direct", "target_direct"]:
+            raise ValueError(
+                f"prediction_mode must be 'autoregressive', 'direct', or 'target_direct', got {self.prediction_mode}"
+            )
+        if self.prediction_mode == "autoregressive" and self.decoder_type == "none":
+            raise ValueError(
+                "decoder_type cannot be 'none' when prediction_mode is 'autoregressive'"
             )
         if self.hidden_dim <= 0:
             raise ValueError(f"hidden_dim must be positive, got {self.hidden_dim}")
@@ -91,6 +148,22 @@ class ModelConfig:
         if not 0 <= self.teacher_forcing_ratio <= 1:
             raise ValueError(
                 f"teacher_forcing_ratio must be in [0, 1], got {self.teacher_forcing_ratio}"
+            )
+        if self.prediction_mode in {"direct", "target_direct"}:
+            self.teacher_forcing_ratio = 0.0
+        if self.prediction_mode == "target_direct":
+            self.decoder_type = "none"
+        if self.use_input_projection:
+            if self.input_projection_dim is None:
+                self.input_projection_dim = self.hidden_dim
+            if self.input_projection_dim <= 0:
+                raise ValueError("input_projection_dim must be positive when projection is enabled")
+            self.encoder_input_dim = self.input_projection_dim
+        else:
+            self.encoder_input_dim = self.input_dim
+        if self.ball_context_dim < 0:
+            raise ValueError(
+                f"ball_context_dim must be non-negative, got {self.ball_context_dim}"
             )
 
 
@@ -108,10 +181,11 @@ class TrainingConfig:
     gradient_clip_val: float = 1.0
 
     # Scheduler
-    scheduler: str = "reduce_on_plateau"  # 'reduce_on_plateau', 'cosine', or 'none'
+    scheduler: str = "reduce_on_plateau"  # 'reduce_on_plateau', 'cosine', 'cosine_warmup', or 'none'
     scheduler_patience: int = 5
     scheduler_factor: float = 0.5
     scheduler_min_lr: float = 1e-6
+    scheduler_warmup_epochs: int = 5
 
     # Checkpointing
     checkpoint_dir: str = "checkpoints/approach1_v0"
@@ -142,11 +216,15 @@ class TrainingConfig:
             )
         if self.scheduler not in ["reduce_on_plateau", "cosine", "none"]:
             raise ValueError(
-                f"scheduler must be 'reduce_on_plateau', 'cosine', or 'none', got {self.scheduler}"
+                f"scheduler must be 'reduce_on_plateau', 'cosine', 'cosine_warmup', or 'none', got {self.scheduler}"
             )
         if self.monitor_mode not in ["min", "max"]:
             raise ValueError(
                 f"monitor_mode must be 'min' or 'max', got {self.monitor_mode}"
+            )
+        if self.scheduler_warmup_epochs < 0:
+            raise ValueError(
+                f"scheduler_warmup_epochs must be >= 0, got {self.scheduler_warmup_epochs}"
             )
 
 

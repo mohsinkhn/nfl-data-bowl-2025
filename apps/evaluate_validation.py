@@ -16,8 +16,9 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Dict, List
 
-from src.configs.config_approach1_v0 import DataConfig
-from src.data import NFLTrajectoryDataset, collate_fn
+from src.configs.config_approach1_v0 import DataConfig, ModelConfig, TrainingConfig
+from src.utils.normalization import reconstruct_trajectory_from_polar
+from src.data import NFLTrajectoryDataset, TargetReceiverTrajectoryDataset, collate_fn
 from src.trainer import TrajectoryPredictionModule
 from torch.utils.data import DataLoader
 
@@ -49,11 +50,28 @@ def evaluate_on_validation(
     print(f"\nLoading checkpoint...")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     data_config = DataConfig(**checkpoint["hyper_parameters"]["data_config"])
+    model_config = ModelConfig(**checkpoint["hyper_parameters"]["model_config"])
+    training_config = TrainingConfig(**checkpoint["hyper_parameters"]["training_config"])
     print(f"✓ Configs loaded")
 
     # Create validation dataset
     print(f"\nCreating validation dataset...")
-    val_dataset = NFLTrajectoryDataset(
+    dataset_cls = (
+        TargetReceiverTrajectoryDataset
+        if getattr(data_config, "dataset_type", "baseline") == "target_receiver"
+        else NFLTrajectoryDataset
+    )
+
+    dataset_specific_kwargs = {}
+    if dataset_cls is TargetReceiverTrajectoryDataset:
+        dataset_specific_kwargs.update(
+            {
+                "min_decoder_len": getattr(data_config, "target_min_decoder_len", 1),
+                "filter_target_only": getattr(data_config, "target_only", True),
+            }
+        )
+
+    val_dataset = dataset_cls(
         input_parquet=val_input_parquet,
         output_parquet=val_output_parquet,
         max_encoder_len=data_config.max_encoder_len,
@@ -61,6 +79,14 @@ def evaluate_on_validation(
         feature_cols=data_config.feature_cols,
         normalize=data_config.normalize,
         rotation_normalize=data_config.rotation_normalize,
+        align_heading=getattr(data_config, "align_heading", True),
+        use_player_role=getattr(data_config, "use_player_role", True),
+        use_player_attributes=getattr(data_config, "use_player_attributes", True),
+        use_polar_targets=getattr(data_config, "use_polar_targets", False),
+        use_ball_residual_targets=getattr(
+            data_config, "use_ball_residual_targets", False
+        ),
+        **dataset_specific_kwargs,
     )
 
     val_loader = DataLoader(
@@ -76,7 +102,15 @@ def evaluate_on_validation(
 
     # Load model
     print(f"\nLoading model...")
-    model = TrajectoryPredictionModule.load_from_checkpoint(checkpoint_path)
+    model_config.input_dim = val_dataset.input_dim
+    model_config.output_dim = val_dataset.output_dim
+
+    model = TrajectoryPredictionModule.load_from_checkpoint(
+        checkpoint_path,
+        model_config=model_config,
+        training_config=training_config,
+        data_config=data_config,
+    )
     model.eval()
     model.freeze()
 
@@ -92,6 +126,8 @@ def evaluate_on_validation(
     all_squared_errors = []
     all_metadata = []
 
+    use_polar = getattr(data_config, "use_polar_targets", False)
+
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Evaluating"):
             encoder_input = batch["encoder_input"].to(device)
@@ -100,15 +136,22 @@ def evaluate_on_validation(
             decoder_mask = batch["decoder_mask"]
             metadata = batch["metadata"]
 
-            # Get predictions
-            decoder_start = decoder_input[:, 0, :]
-            max_len = decoder_target.size(1)
-
-            predictions = model.model.predict(
-                encoder_inputs=encoder_input,
-                decoder_start=decoder_start,
-                prediction_steps=int(max_len),
-            )
+            prediction_mode = getattr(model, "prediction_mode", "autoregressive")
+            max_len = int(decoder_mask.sum(dim=1).max().item())
+            if prediction_mode == "autoregressive":
+                decoder_start = decoder_input[:, 0, :]
+                predictions = model.model.predict(
+                    encoder_inputs=encoder_input,
+                    decoder_start=decoder_start,
+                    prediction_steps=int(max_len),
+                )
+            else:
+                predictions = model.model.predict(
+                    encoder_inputs=encoder_input,
+                    encoder_mask=batch.get("encoder_mask"),
+                )
+                if predictions.size(1) > max_len:
+                    predictions = predictions[:, :max_len]
 
             # Convert to CPU
             predictions = predictions.cpu().numpy()  # (batch, max_len, 2)
@@ -124,26 +167,40 @@ def evaluate_on_validation(
 
                 # Get valid length
                 valid_len = int(mask.sum())
-                pred_valid = pred[:valid_len]
-                target_valid = target[:valid_len]
+                if use_polar:
+                    last_pos = np.array(meta["last_position_canonical"], dtype=np.float32)
+                    last_heading = float(meta["last_heading"])
+                    pred_valid = reconstruct_trajectory_from_polar(
+                        pred[:valid_len], last_pos, last_heading
+                    )
+                    target_valid = np.asarray(
+                        meta["decoder_target_cartesian"], dtype=np.float32
+                    )[:valid_len]
+                elif bool(meta.get("use_ball_residual_targets", False)):
+                    landing = np.array(meta["ball_land_canonical"], dtype=np.float32)
+                    pred_valid = landing - pred[:valid_len]
+                    target_valid = landing - target[:valid_len]
+                else:
+                    pred_valid = pred[:valid_len]
+                    target_valid = target[:valid_len]
 
                 # Get transform for inverse normalization
                 transform = meta.get("transform")
 
                 if transform is not None:
                     # Inverse transform both prediction and ground truth
-                    pred_denorm = transform.inverse_transform(pred_valid)
-                    target_denorm = transform.inverse_transform(target_valid)
+                    pred_denorm = transform.inverse_points(pred_valid)
+                    target_denorm = transform.inverse_points(target_valid)
                 else:
                     pred_denorm = pred_valid
                     target_denorm = target_valid
 
-                # Calculate squared errors per point
-                squared_errors = np.sum((pred_denorm - target_denorm) ** 2, axis=1)
+                # Calculate per-point MSE across coordinates (average x/y error)
+                point_mse = np.mean((pred_denorm - target_denorm) ** 2, axis=1)
 
                 all_predictions.append(pred_denorm)
                 all_ground_truth.append(target_denorm)
-                all_squared_errors.extend(squared_errors.tolist())
+                all_squared_errors.extend(point_mse.tolist())
                 all_metadata.append(meta)
 
     # Calculate overall RMSE
@@ -164,7 +221,7 @@ def evaluate_on_validation(
     for i in range(len(all_predictions)):
         pred = all_predictions[i]
         target = all_ground_truth[i]
-        sample_mse = np.mean(np.sum((pred - target) ** 2, axis=1))
+        sample_mse = np.mean(np.mean((pred - target) ** 2, axis=1))
         per_sample_rmse.append(np.sqrt(sample_mse))
 
     print(f"\nPer-Sample RMSE Statistics:")

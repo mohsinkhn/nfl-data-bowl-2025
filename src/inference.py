@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -25,9 +25,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.configs.config_approach1_v0 import DataConfig, ModelConfig, TrainingConfig
-from src.data import NFLTrajectoryDataset, collate_fn
+from src.data import NFLTrajectoryDataset, TargetReceiverTrajectoryDataset, collate_fn
 from src.trainer import TrajectoryPredictionModule
-from src.utils.normalization import rotate_coordinates
 
 
 def load_test_data(
@@ -120,7 +119,23 @@ def create_test_dataset(
     )
 
     # Create dataset with same config as training
-    test_dataset = NFLTrajectoryDataset(
+    dataset_type = getattr(data_config, "dataset_type", "baseline")
+    dataset_cls = (
+        TargetReceiverTrajectoryDataset
+        if dataset_type == "target_receiver"
+        else NFLTrajectoryDataset
+    )
+
+    target_kwargs: Dict[str, Any] = {}
+    if dataset_cls is TargetReceiverTrajectoryDataset:
+        target_kwargs["min_decoder_len"] = getattr(
+            data_config, "target_min_decoder_len", 1
+        )
+        target_kwargs["filter_target_only"] = getattr(
+            data_config, "target_only", True
+        )
+
+    test_dataset = dataset_cls(
         input_parquet=input_parquet,
         output_parquet=output_parquet,
         max_encoder_len=data_config.max_encoder_len,
@@ -129,6 +144,13 @@ def create_test_dataset(
         normalize=data_config.normalize,
         rotation_normalize=data_config.rotation_normalize,
         align_heading=getattr(data_config, "align_heading", True),
+        use_player_role=getattr(data_config, "use_player_role", True),
+        use_player_attributes=getattr(data_config, "use_player_attributes", True),
+        use_polar_targets=getattr(data_config, "use_polar_targets", False),
+        use_ball_residual_targets=getattr(
+            data_config, "use_ball_residual_targets", False
+        ),
+        **target_kwargs,
     )
 
     return test_dataset
@@ -160,7 +182,20 @@ def run_inference(
 
     # Load model from checkpoint (configs and transform_params restored automatically)
     print(f"\nLoading model from checkpoint...")
-    model = TrajectoryPredictionModule.load_from_checkpoint(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    model_config = ModelConfig(**checkpoint["hyper_parameters"]["model_config"])
+    training_config = TrainingConfig(**checkpoint["hyper_parameters"]["training_config"])
+    data_config = DataConfig(**checkpoint["hyper_parameters"]["data_config"])
+
+    model_config.input_dim = test_dataset.input_dim
+    model_config.output_dim = test_dataset.output_dim
+
+    model = TrajectoryPredictionModule.load_from_checkpoint(
+        checkpoint_path,
+        model_config=model_config,
+        training_config=training_config,
+        data_config=data_config,
+    )
     model.eval()
     model.freeze()
 
@@ -186,6 +221,7 @@ def run_inference(
     model = model.to(device)
 
     predictions = []
+    use_polar = getattr(data_config, "use_polar_targets", False)
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Inference"):
@@ -193,20 +229,32 @@ def run_inference(
             encoder_input = batch["encoder_input"].to(device)
             decoder_input = batch["decoder_input"].to(device)
             decoder_mask = batch["decoder_mask"]
+            encoder_mask = batch.get("encoder_mask")
+            if encoder_mask is not None:
+                encoder_mask = encoder_mask.to(device)
             metadata = batch["metadata"]
 
             # Get max decoder length for this batch
             max_len = decoder_mask.sum(dim=1).max().item()
 
-            # Get decoder start token (last encoder position)
-            decoder_start = decoder_input[:, 0, :]  # (batch, 2)
-
-            # Run model prediction (no teacher forcing)
-            batch_preds = model.model.predict(
-                encoder_inputs=encoder_input,
-                decoder_start=decoder_start,
-                prediction_steps=int(max_len),
-            )
+            prediction_mode = getattr(model, "prediction_mode", "autoregressive")
+            if prediction_mode == "autoregressive":
+                if use_polar:
+                    decoder_start = torch.zeros_like(decoder_input[:, 0, :])
+                else:
+                    decoder_start = decoder_input[:, 0, :]  # (batch, 2)
+                batch_preds = model.model.predict(
+                    encoder_inputs=encoder_input,
+                    decoder_start=decoder_start,
+                    prediction_steps=int(max_len),
+                )
+            else:
+                batch_preds = model.model.predict(
+                    encoder_inputs=encoder_input,
+                    encoder_mask=encoder_mask,
+                )
+                if batch_preds.size(1) > max_len:
+                    batch_preds = batch_preds[:, :max_len]
 
             # Move predictions back to CPU
             batch_preds = batch_preds.cpu().numpy()  # (batch, max_len, 2)
@@ -218,19 +266,24 @@ def run_inference(
 
                 # Get valid predictions (only up to actual sequence length)
                 valid_len = int(mask.sum())
-                pred_valid = pred[:valid_len]  # (valid_len, 2)
+                if use_polar:
+                    last_pos = np.array(meta["last_position_canonical"], dtype=np.float32)
+                    last_heading = float(meta["last_heading"])
+                    pred_valid = reconstruct_trajectory_from_polar(
+                        pred[:valid_len], last_pos, last_heading
+                    )
+                elif bool(meta.get("use_ball_residual_targets", False)):
+                    landing = np.array(meta["ball_land_canonical"], dtype=np.float32)
+                    pred_valid = landing - pred[:valid_len]
+                else:
+                    pred_valid = pred[:valid_len]
 
                 transform = meta.get("transform")
-                heading_angle = float(meta.get("heading_angle", 0.0) or 0.0)
-
-                pred_aligned = pred_valid
-                if heading_angle:
-                    pred_aligned = rotate_coordinates(pred_valid, heading_angle)
 
                 if transform is not None:
-                    pred_denorm = transform.inverse_transform(pred_aligned)
+                    pred_denorm = transform.inverse_points(pred_valid)
                 else:
-                    pred_denorm = pred_aligned
+                    pred_denorm = pred_valid
 
                 # Store predictions with metadata
                 predictions.append(
@@ -240,6 +293,7 @@ def run_inference(
                         "nfl_id": meta["nfl_id"],
                         "predictions": pred_denorm,  # (valid_len, 2) in original coordinates
                         "num_frames": valid_len,
+                        "is_target": bool(meta.get("is_target_receiver", False)),
                     }
                 )
 
@@ -253,77 +307,97 @@ def create_submission_file(
     predictions: List[Dict],
     test_target_df: pd.DataFrame,
     output_path: str,
+    test_input_df: pd.DataFrame,
+    fallback_strategy: str = "hold",
 ) -> None:
-    """Format predictions as submission file.
+    """Format predictions as submission file with full-player coverage.
 
-    Creates a CSV file with columns: id, x, y
-    where id format is: {game_id}_{play_id}_{nfl_id}_{frame_id}
-
-    Args:
-        predictions: List of prediction dictionaries from run_inference
-        test_target_df: Test target DataFrame (contains frame_id structure)
-        output_path: Path to save submission CSV
+    When using the target-only model, defenders/off-ball receivers will not
+    produce predictions. This helper fills their trajectories with a simple
+    fallback (holding the last observed pre-throw position) so dashboards can
+    still render every player.
     """
     print(f"\n{'='*60}")
     print("Creating Submission File")
     print(f"{'='*60}")
 
-    # Create a lookup for frame_ids from test_target
-    frame_lookup = {}
+    # Structure frames and prediction lookups.
+    frame_lookup: Dict[Tuple[int, int, int], List[int]] = {}
     for (game_id, play_id, nfl_id), group in test_target_df.groupby(
         ["game_id", "play_id", "nfl_id"]
     ):
-        frame_ids = sorted(group["frame_id"].values)
-        frame_lookup[(game_id, play_id, nfl_id)] = frame_ids
+        frame_ids = sorted(group["frame_id"].astype(int).tolist())
+        frame_lookup[(int(game_id), int(play_id), int(nfl_id))] = frame_ids
 
-    # Build submission rows
-    submission_rows = []
+    prediction_lookup: Dict[Tuple[int, int, int], Dict] = {
+        (entry["game_id"], entry["play_id"], entry["nfl_id"]): entry
+        for entry in predictions
+    }
 
-    for pred_dict in tqdm(predictions, desc="Building submission"):
-        game_id = pred_dict["game_id"]
-        play_id = pred_dict["play_id"]
-        nfl_id = pred_dict["nfl_id"]
-        pred_coords = pred_dict["predictions"]  # (num_frames, 2)
+    # Cache last pre-throw position per player for fallback.
+    last_positions = (
+        test_input_df.sort_values(
+            ["game_id", "play_id", "nfl_id", "frame_id"]
+        )
+        .groupby(["game_id", "play_id", "nfl_id"])[["x", "y"]]
+        .last()
+        .reset_index()
+    )
+    last_position_lookup: Dict[Tuple[int, int, int], Tuple[float, float]] = {
+        (int(row.game_id), int(row.play_id), int(row.nfl_id)): (
+            float(row.x),
+            float(row.y),
+        )
+        for row in last_positions.itertuples(index=False)
+    }
 
-        # Get frame_ids for this player
-        key = (game_id, play_id, nfl_id)
-        if key not in frame_lookup:
-            print(f"Warning: No frame_ids found for {key}")
-            continue
+    fallback_strategy = fallback_strategy.lower()
+    fallback_count = 0
 
-        frame_ids = frame_lookup[key]
+    submission_rows: List[Dict[str, float]] = []
 
-        # Check length match
-        if len(pred_coords) != len(frame_ids):
-            print(
-                f"Warning: Length mismatch for {key}: "
-                f"predictions={len(pred_coords)}, frames={len(frame_ids)}"
-            )
-            # Use minimum length
-            n = min(len(pred_coords), len(frame_ids))
-            pred_coords = pred_coords[:n]
-            frame_ids = frame_ids[:n]
+    for key, frame_ids in tqdm(frame_lookup.items(), desc="Building submission"):
+        pred_entry = prediction_lookup.get(key)
+        frames = frame_ids
 
-        # Create submission rows
-        for frame_id, (x, y) in zip(frame_ids, pred_coords):
+        if pred_entry is not None:
+            pred_coords = pred_entry["predictions"]
+            if len(pred_coords) != len(frames):
+                print(
+                    f"Warning: Length mismatch for {key}: "
+                    f"predictions={len(pred_coords)}, frames={len(frames)}"
+                )
+                n = min(len(pred_coords), len(frames))
+                pred_coords = pred_coords[:n]
+                frames = frames[:n]
+        else:
+            fallback_count += 1
+            last_xy = last_position_lookup.get(key, (0.0, 0.0))
+            if fallback_strategy == "hold" or len(frames) == 0:
+                pred_coords = np.repeat(
+                    np.array(last_xy, dtype=np.float32)[None, :], len(frames), axis=0
+                )
+            else:
+                pred_coords = np.repeat(
+                    np.array(last_xy, dtype=np.float32)[None, :], len(frames), axis=0
+                )
+
+        game_id, play_id, nfl_id = key
+        for frame_id, (x, y) in zip(frames, pred_coords):
             row_id = f"{game_id}_{play_id}_{nfl_id}_{frame_id}"
             submission_rows.append({"id": row_id, "x": float(x), "y": float(y)})
 
-    # Create DataFrame
     submission_df = pd.DataFrame(submission_rows)
-
-    # Sort by id for consistency
     submission_df = submission_df.sort_values("id").reset_index(drop=True)
-
-    # Save to CSV
     submission_df.to_csv(output_path, index=False)
 
     print(f"\n✓ Submission file created")
     print(f"  Path: {output_path}")
     print(f"  Total predictions: {len(submission_df):,}")
-    print(f"  Unique players: {len(predictions):,}")
+    print(f"  Unique players: {len(frame_lookup):,}")
+    if fallback_count:
+        print(f"  Fallback trajectories applied: {fallback_count:,}")
 
-    # Show sample
     print(f"\nSample predictions:")
     print(submission_df.head(10).to_string(index=False))
 
@@ -369,6 +443,13 @@ def main() -> None:
         default=4,
         help="Number of data loading workers",
     )
+    parser.add_argument(
+        "--fallback_strategy",
+        type=str,
+        default="hold",
+        choices=["hold"],
+        help="Fallback trajectory policy for non-target players",
+    )
 
     args = parser.parse_args()
 
@@ -411,7 +492,13 @@ def main() -> None:
     )
 
     # Create submission file
-    create_submission_file(predictions, test_target_df, args.output_path)
+    create_submission_file(
+        predictions,
+        test_target_df,
+        args.output_path,
+        test_input_df=test_input_df,
+        fallback_strategy=args.fallback_strategy,
+    )
 
     print(f"\n{'='*60}")
     print("✓ Inference pipeline complete!")

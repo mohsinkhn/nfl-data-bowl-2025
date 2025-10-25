@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+.coverage
+.pytest_cache/
+
+# Data
+data/
+*.csv
+!data/sample_submission.csv
+
+# Model artifacts
+checkpoints/
+logs/
+wandb/
+
+# Outputs
+outputs/
+plots/
+
+# Node
+node_modules/
+package-lock.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

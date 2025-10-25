@@ -10,6 +10,7 @@ Fold strategies:
 
 import argparse
 from pathlib import Path
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -57,6 +58,17 @@ def prepare_fold(data_dir: Path, output_dir: Path, fold: str) -> None:
     print("\nLoading validation data...")
     val_input = load_weeks(data_dir, val_weeks, "input")
     val_output = load_weeks(data_dir, val_weeks, "output")
+
+    def add_ball_features(df: pd.DataFrame) -> pd.DataFrame:
+        delta_x = df["ball_land_x"] - df["x"]
+        delta_y = df["ball_land_y"] - df["y"]
+        df["ball_angle"] = np.degrees(np.arctan2(delta_y, delta_x)) % 360.0
+        df["dir"] = (90.0 - df["dir"]) % 360.0
+        df["o"] = (90.0 - df["o"]) % 360.0
+        return df
+
+    train_input = add_ball_features(train_input)
+    val_input = add_ball_features(val_input)
 
     # Save to parquet
     print("\nSaving files...")
